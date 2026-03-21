@@ -46,6 +46,10 @@ type Blocker struct {
 	State      string `json:"state,omitempty"`
 }
 
+// TokenRefreshCallback is called after a successful token refresh with the new
+// access token and (optionally rotated) refresh token so callers can persist them.
+type TokenRefreshCallback func(accessToken, refreshToken string)
+
 // Client is a Linear GraphQL API client.
 type Client struct {
 	endpoint   string
@@ -57,6 +61,9 @@ type Client struct {
 	oauthClientID     string
 	oauthClientSecret string
 	refreshToken      string
+
+	onTokenRefresh TokenRefreshCallback
+	fallbackToken  string // Shell env token to try if primary auth + refresh both fail
 }
 
 // NewClient creates a new Linear client using a personal API key.
@@ -91,6 +98,18 @@ func NewClientWithToken(endpoint, accessToken, clientID, clientSecret, refreshTo
 			Timeout: 30 * time.Second,
 		},
 	}
+}
+
+// SetOnTokenRefresh registers a callback that is invoked after a successful
+// token refresh. This allows callers to persist the new tokens (e.g. to .env).
+func (c *Client) SetOnTokenRefresh(cb TokenRefreshCallback) {
+	c.onTokenRefresh = cb
+}
+
+// SetFallbackToken sets a fallback access token (e.g. from shell environment)
+// that will be tried if the primary token and refresh both fail authentication.
+func (c *Client) SetFallbackToken(token string) {
+	c.fallbackToken = token
 }
 
 // graphqlRequest represents a GraphQL request payload.
@@ -389,11 +408,24 @@ func (c *Client) execute(ctx context.Context, query string, variables map[string
 
 	// On 401, attempt token refresh if OAuth credentials are available.
 	if statusCode == http.StatusUnauthorized && c.canRefresh() {
-		if refreshErr := c.tryRefreshToken(); refreshErr != nil {
-			return nil, fmt.Errorf("token refresh failed: %w (original error: %v)", refreshErr, err)
+		if refreshErr := c.tryRefreshToken(); refreshErr == nil {
+			// Retry with the new token.
+			data, _, retryErr := c.doRequest(ctx, query, variables)
+			if retryErr == nil {
+				return data, nil
+			}
 		}
-		// Retry with the new token.
-		data, _, err = c.doRequest(ctx, query, variables)
+	}
+
+	// If still failing and we have a fallback token, try it.
+	if statusCode == http.StatusUnauthorized && c.fallbackToken != "" && c.fallbackToken != c.accessToken {
+		c.accessToken = c.fallbackToken
+		c.fallbackToken = "" // Don't retry fallback again
+		data, _, fallbackErr := c.doRequest(ctx, query, variables)
+		if fallbackErr == nil {
+			return data, nil
+		}
+		// Return original error since fallback also failed
 	}
 
 	return data, err
@@ -406,7 +438,8 @@ func (c *Client) canRefresh() bool {
 }
 
 // tryRefreshToken exchanges the refresh token for a new access token and
-// updates the client's in-memory token.
+// updates the client's in-memory token. If an OnTokenRefresh callback is
+// registered, it is called so the caller can persist the new credentials.
 func (c *Client) tryRefreshToken() error {
 	resp, err := RefreshAccessToken(c.oauthClientID, c.oauthClientSecret, c.refreshToken)
 	if err != nil {
@@ -415,6 +448,9 @@ func (c *Client) tryRefreshToken() error {
 	c.accessToken = resp.AccessToken
 	if resp.RefreshToken != "" {
 		c.refreshToken = resp.RefreshToken
+	}
+	if c.onTokenRefresh != nil {
+		c.onTokenRefresh(c.accessToken, c.refreshToken)
 	}
 	return nil
 }

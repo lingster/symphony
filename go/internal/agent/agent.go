@@ -12,7 +12,8 @@ type Agent interface {
 	Name() string
 
 	// Start launches an agent session in the given workspace with the prompt.
-	Start(ctx context.Context, workspace string, prompt string) (Session, error)
+	// systemPrompt is optional additional context appended to the system prompt.
+	Start(ctx context.Context, workspace string, prompt string, systemPrompt string) (Session, error)
 }
 
 // Session represents an active agent session.

@@ -25,10 +25,12 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/ling/symphony/internal/envfile"
 	"github.com/ling/symphony/internal/linear"
 )
 
@@ -39,6 +41,13 @@ const (
 )
 
 func main() {
+	// Load .env from the current directory so credentials don't need to be
+	// passed as environment variables on every invocation.
+	envPath := findEnvFile()
+	if envPath != "" {
+		loadDotEnv(envPath)
+	}
+
 	clientID := requireEnv("LINEAR_OAUTH_CLIENT_ID")
 	clientSecret := requireEnv("LINEAR_OAUTH_CLIENT_SECRET")
 
@@ -108,15 +117,33 @@ func main() {
 	fmt.Println()
 	fmt.Printf("  Scopes: %s\n", tokenResp.Scope)
 	fmt.Println()
-	fmt.Println("Add these to your environment (e.g. ~/.bashrc or ~/.zshrc):")
-	fmt.Println()
-	fmt.Printf("  export LINEAR_AGENT_TOKEN=%s\n", tokenResp.AccessToken)
+
+	// Persist tokens to .env file.
+	kvs := map[string]string{"LINEAR_AGENT_TOKEN": tokenResp.AccessToken}
 	if tokenResp.RefreshToken != "" {
-		fmt.Printf("  export LINEAR_REFRESH_TOKEN=%s\n", tokenResp.RefreshToken)
-		fmt.Println()
-		fmt.Println("  AUTO-REFRESH ENABLED — the orchestrator will renew the token automatically.")
+		kvs["LINEAR_REFRESH_TOKEN"] = tokenResp.RefreshToken
+	}
+	if envPath != "" {
+		if err := envfile.Update(envPath, kvs); err != nil {
+			fmt.Printf("  WARNING: could not update %s: %v\n", envPath, err)
+			fmt.Println("  You will need to update your .env file manually.")
+		} else {
+			fmt.Printf("  Updated %s with new tokens.\n", envPath)
+		}
 	} else {
+		fmt.Println("  No .env file found. Add these to your environment:")
 		fmt.Println()
+		fmt.Printf("  export LINEAR_AGENT_TOKEN=%s\n", tokenResp.AccessToken)
+		if tokenResp.RefreshToken != "" {
+			fmt.Printf("  export LINEAR_REFRESH_TOKEN=%s\n", tokenResp.RefreshToken)
+		}
+	}
+	fmt.Println()
+
+	if tokenResp.RefreshToken != "" {
+		fmt.Println("  AUTO-REFRESH ENABLED — the orchestrator will renew the token")
+		fmt.Println("  automatically and persist updates to .env.")
+	} else {
 		fmt.Println("  WARNING: No refresh token received. You will need to re-run this setup")
 		fmt.Println("  when the access token expires.")
 	}
@@ -249,6 +276,39 @@ func readFromStdin(codeCh chan<- string, errCh chan<- error) {
 	}
 
 	errCh <- fmt.Errorf("could not extract authorization code from input: %q", input)
+}
+
+// findEnvFile looks for a .env file in the current directory, then walks up
+// to the repository root looking for one.
+func findEnvFile() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	for {
+		candidate := filepath.Join(dir, ".env")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// loadDotEnv reads a .env file and sets all keys as environment variables,
+// overwriting any existing shell values so .env takes precedence.
+func loadDotEnv(path string) {
+	kvs, err := envfile.Load(path)
+	if err != nil {
+		return
+	}
+	for k, v := range kvs {
+		os.Setenv(k, v)
+	}
 }
 
 func isValidCode(s string) bool {

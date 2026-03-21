@@ -29,7 +29,11 @@ func (a *CodexAgent) Name() string {
 	return "codex"
 }
 
-func (a *CodexAgent) Start(ctx context.Context, workspace string, prompt string) (Session, error) {
+func (a *CodexAgent) Start(ctx context.Context, workspace string, prompt string, systemPrompt string) (Session, error) {
+	// Codex doesn't support a separate system prompt flag; prepend it to the user prompt.
+	if systemPrompt != "" {
+		prompt = systemPrompt + "\n\n---\n\n" + prompt
+	}
 	cmd := exec.CommandContext(ctx, "bash", "-lc", a.command)
 	cmd.Dir = workspace
 	cmd.Env = append(os.Environ(), "CODEX_WORKSPACE="+workspace)
@@ -53,24 +57,30 @@ func (a *CodexAgent) Start(ctx context.Context, workspace string, prompt string)
 		return nil, fmt.Errorf("failed to start codex: %w", err)
 	}
 
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024) // 10MB buffer
+
 	session := &codexSession{
 		cmd:       cmd,
 		stdin:     stdin,
 		stdout:    stdout,
 		stderr:    stderr,
+		scanner:   scanner,
 		events:    make(chan Event, 100),
 		done:      make(chan struct{}),
 		workspace: workspace,
 	}
 
-	go session.readLoop()
 	go session.drainStderr()
 
-	// Send initialization sequence
+	// Send initialization sequence (reads responses synchronously to get thread ID)
 	if err := session.initialize(prompt); err != nil {
 		session.Stop()
 		return nil, fmt.Errorf("failed to initialize session: %w", err)
 	}
+
+	// Now start async read loop for agent events
+	go session.readLoop()
 
 	return session, nil
 }
@@ -80,6 +90,7 @@ type codexSession struct {
 	stdin     io.WriteCloser
 	stdout    io.ReadCloser
 	stderr    io.ReadCloser
+	scanner   *bufio.Scanner
 	events    chan Event
 	done      chan struct{}
 	workspace string
@@ -142,12 +153,23 @@ func (s *codexSession) initialize(prompt string) error {
 		"id":     s.nextRequestID(),
 		"method": "initialize",
 		"params": map[string]interface{}{
-			"clientInfo":   map[string]string{"name": "symphony", "version": "1.0"},
-			"capabilities": map[string]interface{}{},
+			"clientInfo": map[string]string{
+				"name":    "symphony-orchestrator",
+				"title":   "Symphony Orchestrator",
+				"version": "0.1.0",
+			},
+			"capabilities": map[string]interface{}{
+				"experimentalApi": true,
+			},
 		},
 	}
 	if err := s.sendJSON(initReq); err != nil {
 		return err
+	}
+
+	// Wait for initialize response
+	if err := s.waitForResponse(); err != nil {
+		return fmt.Errorf("waiting for initialize response: %w", err)
 	}
 
 	// Send initialized notification
@@ -164,8 +186,8 @@ func (s *codexSession) initialize(prompt string) error {
 		"id":     s.nextRequestID(),
 		"method": "thread/start",
 		"params": map[string]interface{}{
-			"approvalPolicy": "auto-edit",
-			"sandbox":        "none",
+			"approvalPolicy": "never",
+			"sandbox":        "workspace-write",
 			"cwd":            s.workspace,
 		},
 	}
@@ -173,21 +195,113 @@ func (s *codexSession) initialize(prompt string) error {
 		return err
 	}
 
-	// Start turn with prompt
+	// Wait for thread/start response and extract thread ID
+	if err := s.waitForThreadID(); err != nil {
+		return fmt.Errorf("waiting for thread ID: %w", err)
+	}
+
+	// Start turn with prompt — now we have the real thread ID
 	turnReq := map[string]interface{}{
 		"id":     s.nextRequestID(),
 		"method": "turn/start",
 		"params": map[string]interface{}{
-			"threadId": "", // Will be filled by app-server response
+			"threadId": s.threadID,
 			"input": []map[string]string{
 				{"type": "text", "text": prompt},
 			},
 			"cwd":            s.workspace,
-			"approvalPolicy": "auto-edit",
-			"sandboxPolicy":  map[string]string{"type": "none"},
+			"approvalPolicy": "never",
+			"sandboxPolicy": map[string]interface{}{
+				"type":                "workspaceWrite",
+				"writableRoots":      []string{s.workspace},
+				"readOnlyAccess":     map[string]string{"type": "fullAccess"},
+				"networkAccess":      false,
+				"excludeTmpdirEnvVar": false,
+				"excludeSlashTmp":    false,
+			},
 		},
 	}
 	return s.sendJSON(turnReq)
+}
+
+// waitForResponse reads lines from the scanner until a JSON-RPC response (has "id", no "method") is found.
+// Notifications encountered along the way are logged but skipped.
+func (s *codexSession) waitForResponse() error {
+	for s.scanner.Scan() {
+		line := s.scanner.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			fmt.Fprintf(os.Stderr, "[codex stdout skip] %s\n", string(line))
+			continue
+		}
+
+		var msg map[string]interface{}
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "[codex raw] %s\n", string(line))
+
+		_, hasID := msg["id"]
+		_, hasMethod := msg["method"].(string)
+
+		if hasID && !hasMethod {
+			// Check for error
+			if errObj, ok := msg["error"].(map[string]interface{}); ok {
+				return fmt.Errorf("RPC error: %v", errObj["message"])
+			}
+			return nil
+		}
+		// It's a notification — log and continue waiting
+	}
+	return fmt.Errorf("scanner ended before response received")
+}
+
+// waitForThreadID reads lines until it finds the thread/start response containing the thread ID.
+// Notifications encountered along the way are forwarded to the events channel.
+func (s *codexSession) waitForThreadID() error {
+	for s.scanner.Scan() {
+		line := s.scanner.Bytes()
+		if len(line) == 0 || line[0] != '{' {
+			fmt.Fprintf(os.Stderr, "[codex stdout skip] %s\n", string(line))
+			continue
+		}
+
+		var msg map[string]interface{}
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "[codex raw] %s\n", string(line))
+
+		_, hasID := msg["id"]
+		method, hasMethod := msg["method"].(string)
+
+		if hasID && !hasMethod {
+			// This is the response to thread/start
+			if errObj, ok := msg["error"].(map[string]interface{}); ok {
+				return fmt.Errorf("RPC error: %v", errObj["message"])
+			}
+			if result, ok := msg["result"].(map[string]interface{}); ok {
+				if thread, ok := result["thread"].(map[string]interface{}); ok {
+					if id, ok := thread["id"].(string); ok {
+						s.threadID = id
+						return nil
+					}
+				}
+			}
+			return fmt.Errorf("thread/start response did not contain thread ID")
+		}
+
+		// It's a notification — emit as event if meaningful
+		if hasMethod && method != "" {
+			event := s.parseMessage(msg, line)
+			select {
+			case s.events <- event:
+			default:
+			}
+		}
+	}
+	return fmt.Errorf("scanner ended before thread ID received")
 }
 
 func (s *codexSession) sendJSON(v interface{}) error {
@@ -201,12 +315,16 @@ func (s *codexSession) sendJSON(v interface{}) error {
 
 func (s *codexSession) readLoop() {
 	defer close(s.events)
-	scanner := bufio.NewScanner(s.stdout)
-	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024) // 10MB buffer
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	for s.scanner.Scan() {
+		line := s.scanner.Bytes()
 		if len(line) == 0 {
+			continue
+		}
+
+		// Skip non-JSON lines (e.g. nvm output from login shell)
+		if line[0] != '{' {
+			fmt.Fprintf(os.Stderr, "[codex stdout skip] %s\n", string(line))
 			continue
 		}
 
@@ -214,9 +332,21 @@ func (s *codexSession) readLoop() {
 		if err := json.Unmarshal(line, &msg); err != nil {
 			s.events <- Event{
 				Type:    EventTypeError,
-				Content: fmt.Sprintf("malformed JSON: %v", err),
+				Content: fmt.Sprintf("malformed JSON: %v\nraw line: %s", err, string(line)),
 				Raw:     line,
 			}
+			continue
+		}
+
+		// Debug: log raw JSON-RPC messages
+		fmt.Fprintf(os.Stderr, "[codex raw] %s\n", string(line))
+
+		// Distinguish JSON-RPC responses (have "id", no "method") from notifications (have "method")
+		method, hasMethod := msg["method"].(string)
+		_, hasID := msg["id"]
+
+		if hasID && !hasMethod {
+			// Responses are not agent events; skip emitting them
 			continue
 		}
 
@@ -228,11 +358,9 @@ func (s *codexSession) readLoop() {
 		}
 
 		// Check for turn completion
-		if method, ok := msg["method"].(string); ok {
-			if method == "turn/completed" || method == "turn/failed" || method == "turn/cancelled" {
-				s.events <- Event{Type: EventTypeComplete, Content: method}
-				return
-			}
+		if method == "turn/completed" || method == "turn/failed" || method == "turn/cancelled" {
+			s.events <- Event{Type: EventTypeComplete, Content: method}
+			return
 		}
 	}
 }
@@ -241,34 +369,71 @@ func (s *codexSession) parseMessage(msg map[string]interface{}, raw []byte) Even
 	method, _ := msg["method"].(string)
 
 	switch method {
-	case "thread/start":
-		if result, ok := msg["result"].(map[string]interface{}); ok {
-			if thread, ok := result["thread"].(map[string]interface{}); ok {
-				s.threadID, _ = thread["id"].(string)
-			}
-		}
-		return Event{Type: EventTypeMessage, Content: "session_started", Raw: raw}
-
-	case "item/message":
-		content := ""
-		if params, ok := msg["params"].(map[string]interface{}); ok {
-			if text, ok := params["text"].(string); ok {
-				content = text
-			}
-		}
+	case "item/message", "item/agentMessage/delta":
+		content := extractTextContent(msg)
 		return Event{Type: EventTypeMessage, Content: content, Raw: raw}
 
 	case "item/tool/call":
-		return Event{Type: EventTypeToolUse, Content: "tool_call", Raw: raw}
+		toolName := ""
+		if params, ok := msg["params"].(map[string]interface{}); ok {
+			toolName, _ = params["name"].(string)
+		}
+		if toolName == "" {
+			toolName = "tool_call"
+		}
+		return Event{Type: EventTypeToolUse, Content: toolName, Raw: raw}
 
 	case "item/tool/result":
 		return Event{Type: EventTypeToolResult, Content: "tool_result", Raw: raw}
+
+	case "turn/completed", "turn/failed", "turn/cancelled":
+		return Event{Type: EventTypeComplete, Content: method, Raw: raw}
 
 	default:
 		return Event{Type: EventTypeMessage, Content: method, Raw: raw}
 	}
 }
 
+// extractTextContent tries multiple paths to find text content in a codex message,
+// mirroring the Elixir implementation's flexible path-based extraction.
+func extractTextContent(msg map[string]interface{}) string {
+	params, ok := msg["params"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	// Try direct paths under params
+	roots := []map[string]interface{}{params}
+
+	// Also try params.msg and params.msg.payload as roots
+	if msgObj, ok := params["msg"].(map[string]interface{}); ok {
+		roots = append(roots, msgObj)
+		if payload, ok := msgObj["payload"].(map[string]interface{}); ok {
+			roots = append(roots, payload)
+		}
+	}
+
+	// Text field names in priority order (matching Elixir's delta_paths)
+	fields := []string{"delta", "textDelta", "outputDelta", "text", "summaryText", "content"}
+
+	for _, root := range roots {
+		for _, field := range fields {
+			if val, ok := root[field].(string); ok && val != "" {
+				return val
+			}
+		}
+	}
+
+	return ""
+}
+
 func (s *codexSession) drainStderr() {
-	io.Copy(io.Discard, s.stderr)
+	scanner := bufio.NewScanner(s.stderr)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			fmt.Fprintf(os.Stderr, "[codex stderr] %s\n", line)
+		}
+	}
 }

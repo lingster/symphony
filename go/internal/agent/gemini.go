@@ -29,8 +29,12 @@ func (a *GeminiAgent) Name() string {
 	return "gemini"
 }
 
-func (a *GeminiAgent) Start(ctx context.Context, workspace string, prompt string) (Session, error) {
-	// Gemini CLI uses -p for prompt and --output-format stream-json for streaming
+func (a *GeminiAgent) Start(ctx context.Context, workspace string, prompt string, systemPrompt string) (Session, error) {
+	// Gemini CLI uses -p for prompt and --output-format stream-json for streaming.
+	// Gemini doesn't support a separate system prompt flag; prepend it to the user prompt.
+	if systemPrompt != "" {
+		prompt = systemPrompt + "\n\n---\n\n" + prompt
+	}
 	cmd := exec.CommandContext(ctx, a.command, "-p", prompt, "--output-format", "stream-json")
 	cmd.Dir = workspace
 	cmd.Env = os.Environ()

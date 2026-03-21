@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ling/symphony/internal/envfile"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,6 +41,10 @@ type TrackerConfig struct {
 	OAuthClientID     string `yaml:"oauth_client_id"`
 	OAuthClientSecret string `yaml:"oauth_client_secret"`
 	RefreshToken      string `yaml:"refresh_token"`
+
+	// Fallback tokens from shell environment, used when .env tokens fail auth.
+	FallbackAgentToken string `yaml:"-"`
+	FallbackAPIKey     string `yaml:"-"`
 }
 
 // PollingConfig holds polling settings.
@@ -93,17 +98,40 @@ type ServerConfig struct {
 type Workflow struct {
 	Config         Config
 	PromptTemplate string
-	SkillContent   string // Loaded from agent.skill_path if set
+	SkillContent   string            // Loaded from agent.skill_path if set
+	EnvFilePath    string            // Path to the .env file that was loaded (if any)
+	ShellFallbacks map[string]string // Original shell env values overwritten by .env
 }
 
-// LoadWorkflow loads and parses a WORKFLOW.md file.
+// LoadWorkflow loads and parses a WORKFLOW.md file. It also loads a .env file
+// from the same directory (if present), setting environment variables before
+// resolving config values.
 func LoadWorkflow(path string) (*Workflow, error) {
+	// Load .env from the workflow file's directory.
+	dir := filepath.Dir(path)
+	envPath := filepath.Join(dir, ".env")
+	shellFallbacks := loadDotEnv(envPath)
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read workflow file: %w", err)
 	}
 
-	return ParseWorkflow(data)
+	workflow, err := ParseWorkflow(data)
+	if err != nil {
+		return nil, err
+	}
+
+	// Record the .env path so callers can persist token updates.
+	if _, statErr := os.Stat(envPath); statErr == nil {
+		workflow.EnvFilePath = envPath
+	}
+
+	// Store shell fallbacks and apply them to tracker config.
+	workflow.ShellFallbacks = shellFallbacks
+	applyShellFallbacks(&workflow.Config, shellFallbacks)
+
+	return workflow, nil
 }
 
 // ParseWorkflow parses WORKFLOW.md content.
@@ -291,6 +319,37 @@ func expandPath(path string) string {
 	// Resolve environment variables
 	path = os.ExpandEnv(path)
 	return path
+}
+
+// loadDotEnv reads key=value pairs from the given .env file and sets them as
+// environment variables, overwriting any existing values (so .env takes
+// precedence over shell exports). Returns the original shell values for
+// token-related keys that were overwritten, enabling fallback if .env tokens
+// are invalid. Errors are silently ignored (the file may not exist).
+func loadDotEnv(path string) map[string]string {
+	kvs, err := envfile.Load(path)
+	if err != nil {
+		return nil
+	}
+	originals := make(map[string]string)
+	for k, v := range kvs {
+		if existing := os.Getenv(k); existing != "" && existing != v {
+			originals[k] = existing
+		}
+		os.Setenv(k, v)
+	}
+	return originals
+}
+
+// applyShellFallbacks populates fallback token fields on cfg.Tracker from the
+// shell fallback map captured before .env values overwrote them.
+func applyShellFallbacks(cfg *Config, fallbacks map[string]string) {
+	if v, ok := fallbacks["LINEAR_AGENT_TOKEN"]; ok {
+		cfg.Tracker.FallbackAgentToken = v
+	}
+	if v, ok := fallbacks["LINEAR_API_KEY"]; ok {
+		cfg.Tracker.FallbackAPIKey = v
+	}
 }
 
 // Validate checks that the configuration is valid for dispatch.

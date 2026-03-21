@@ -12,6 +12,7 @@ import (
 
 	"github.com/ling/symphony/internal/agent"
 	"github.com/ling/symphony/internal/config"
+	"github.com/ling/symphony/internal/envfile"
 	"github.com/ling/symphony/internal/linear"
 	"github.com/ling/symphony/internal/workspace"
 )
@@ -70,6 +71,23 @@ func New(cfg *config.Workflow, logger *slog.Logger) (*Orchestrator, error) {
 			cfg.Config.Tracker.OAuthClientSecret,
 			cfg.Config.Tracker.RefreshToken,
 		)
+		if cfg.EnvFilePath != "" {
+			envPath := cfg.EnvFilePath
+			tracker.SetOnTokenRefresh(func(accessToken, refreshToken string) {
+				kvs := map[string]string{"LINEAR_AGENT_TOKEN": accessToken}
+				if refreshToken != "" {
+					kvs["LINEAR_REFRESH_TOKEN"] = refreshToken
+				}
+				if err := envfile.Update(envPath, kvs); err != nil {
+					logger.Warn("failed to persist refreshed tokens to .env", "error", err)
+				} else {
+					logger.Info("persisted refreshed tokens to .env", "path", envPath)
+				}
+			})
+		}
+		if cfg.Config.Tracker.FallbackAgentToken != "" {
+			tracker.SetFallbackToken(cfg.Config.Tracker.FallbackAgentToken)
+		}
 	} else {
 		tracker = linear.NewClient(cfg.Config.Tracker.Endpoint, cfg.Config.Tracker.APIKey)
 	}
@@ -564,7 +582,7 @@ func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) 
 	}
 
 	// Start agent session
-	session, err := selectedAgent.Start(ctx, ws.Path, prompt)
+	session, err := selectedAgent.Start(ctx, ws.Path, prompt, o.config.SkillContent)
 	if err != nil {
 		logger.Error("agent start failed", "error", err)
 		o.handleWorkerFailure(issue, 1, err.Error())
@@ -677,6 +695,7 @@ func (o *Orchestrator) buildPrompt(issue linear.Issue, attempt *int) (string, er
 
 	// Simple template substitution
 	prompt := template
+	prompt = strings.ReplaceAll(prompt, "{{issue.id}}", issue.ID)
 	prompt = strings.ReplaceAll(prompt, "{{issue.identifier}}", issue.Identifier)
 	prompt = strings.ReplaceAll(prompt, "{{issue.title}}", issue.Title)
 	prompt = strings.ReplaceAll(prompt, "{{issue.description}}", issue.Description)
@@ -690,11 +709,6 @@ func (o *Orchestrator) buildPrompt(issue linear.Issue, attempt *int) (string, er
 		prompt = strings.ReplaceAll(prompt, "{{attempt}}", fmt.Sprintf("%d", *attempt))
 	} else {
 		prompt = strings.ReplaceAll(prompt, "{{attempt}}", "")
-	}
-
-	// Prepend skill content if available
-	if o.config.SkillContent != "" {
-		prompt = o.config.SkillContent + "\n\n---\n\n" + prompt
 	}
 
 	return prompt, nil
@@ -869,6 +883,11 @@ func (o *Orchestrator) Agents() *agent.Registry {
 // BuildPromptForIssue builds a prompt for a given issue (public wrapper).
 func (o *Orchestrator) BuildPromptForIssue(issue linear.Issue) (string, error) {
 	return o.buildPrompt(issue, nil)
+}
+
+// SkillContent returns the loaded skill content from the workflow configuration.
+func (o *Orchestrator) SkillContent() string {
+	return o.config.SkillContent
 }
 
 // IssueFilter returns the configured issue filter.

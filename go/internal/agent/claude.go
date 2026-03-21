@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 )
 
@@ -29,9 +30,14 @@ func (a *ClaudeAgent) Name() string {
 	return "claude"
 }
 
-func (a *ClaudeAgent) Start(ctx context.Context, workspace string, prompt string) (Session, error) {
-	// Claude Code uses -p for prompt and --output-format stream-json for streaming
-	cmd := exec.CommandContext(ctx, a.command, "-p", prompt, "--output-format", "stream-json")
+func (a *ClaudeAgent) Start(ctx context.Context, workspace string, prompt string, systemPrompt string) (Session, error) {
+	// Claude Code uses -p for prompt and --output-format stream-json for streaming.
+	// --dangerously-skip-permissions is required for non-interactive execution.
+	args := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"}
+	if systemPrompt != "" {
+		args = append(args, "--append-system-prompt", systemPrompt)
+	}
+	cmd := exec.CommandContext(ctx, a.command, args...)
 	cmd.Dir = workspace
 	cmd.Env = os.Environ()
 
@@ -131,34 +137,20 @@ func (s *claudeSession) readLoop() {
 }
 
 func (s *claudeSession) parseMessage(msg map[string]interface{}, raw []byte) Event {
-	// Claude Code stream-json format
+	// Claude Code stream-json format: tool use and tool results are nested
+	// inside "assistant" and "user" messages as content blocks.
+	//   assistant + content[].type=="tool_use"   → EventTypeToolUse
+	//   assistant + content[].type=="text"        → EventTypeMessage
+	//   user      + content[].type=="tool_result" → EventTypeToolResult
+	//   result                                    → EventTypeComplete
 	msgType, _ := msg["type"].(string)
 
 	switch msgType {
 	case "assistant":
-		content := ""
-		if message, ok := msg["message"].(map[string]interface{}); ok {
-			if contentBlocks, ok := message["content"].([]interface{}); ok {
-				for _, block := range contentBlocks {
-					if b, ok := block.(map[string]interface{}); ok {
-						if text, ok := b["text"].(string); ok {
-							content += text
-						}
-					}
-				}
-			}
-		}
-		return Event{Type: EventTypeMessage, Content: content, Raw: raw}
+		return s.parseAssistantMessage(msg, raw)
 
-	case "tool_use":
-		toolName := ""
-		if name, ok := msg["name"].(string); ok {
-			toolName = name
-		}
-		return Event{Type: EventTypeToolUse, Content: toolName, Raw: raw}
-
-	case "tool_result":
-		return Event{Type: EventTypeToolResult, Content: "tool_result", Raw: raw}
+	case "user":
+		return s.parseUserMessage(msg, raw)
 
 	case "error":
 		errMsg := ""
@@ -168,14 +160,90 @@ func (s *claudeSession) parseMessage(msg map[string]interface{}, raw []byte) Eve
 		return Event{Type: EventTypeError, Content: errMsg, Raw: raw}
 
 	case "result":
-		// Final result
 		return Event{Type: EventTypeComplete, Content: "completed", Raw: raw}
 
 	default:
+		// system, rate_limit_event, etc. — pass through as messages
 		return Event{Type: EventTypeMessage, Content: msgType, Raw: raw}
 	}
 }
 
+// parseAssistantMessage inspects content blocks to distinguish text from tool_use.
+func (s *claudeSession) parseAssistantMessage(msg map[string]interface{}, raw []byte) Event {
+	message, ok := msg["message"].(map[string]interface{})
+	if !ok {
+		return Event{Type: EventTypeMessage, Raw: raw}
+	}
+
+	contentBlocks, ok := message["content"].([]interface{})
+	if !ok {
+		return Event{Type: EventTypeMessage, Raw: raw}
+	}
+
+	// Check what types of content blocks are present
+	var textParts []string
+	var toolNames []string
+
+	for _, block := range contentBlocks {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := b["type"].(string)
+		switch blockType {
+		case "tool_use":
+			name, _ := b["name"].(string)
+			if name == "" {
+				name = "tool_call"
+			}
+			toolNames = append(toolNames, name)
+		case "text":
+			if text, ok := b["text"].(string); ok && text != "" {
+				textParts = append(textParts, text)
+			}
+		}
+	}
+
+	// Emit tool_use events if present (they take priority)
+	if len(toolNames) > 0 {
+		return Event{Type: EventTypeToolUse, Content: strings.Join(toolNames, ", "), Raw: raw}
+	}
+
+	return Event{Type: EventTypeMessage, Content: strings.Join(textParts, ""), Raw: raw}
+}
+
+// parseUserMessage inspects content blocks for tool_result entries.
+func (s *claudeSession) parseUserMessage(msg map[string]interface{}, raw []byte) Event {
+	message, ok := msg["message"].(map[string]interface{})
+	if !ok {
+		return Event{Type: EventTypeMessage, Raw: raw}
+	}
+
+	contentBlocks, ok := message["content"].([]interface{})
+	if !ok {
+		return Event{Type: EventTypeMessage, Raw: raw}
+	}
+
+	for _, block := range contentBlocks {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if blockType, _ := b["type"].(string); blockType == "tool_result" {
+			return Event{Type: EventTypeToolResult, Content: "tool_result", Raw: raw}
+		}
+	}
+
+	return Event{Type: EventTypeMessage, Raw: raw}
+}
+
 func (s *claudeSession) drainStderr() {
-	io.Copy(io.Discard, s.stderr)
+	scanner := bufio.NewScanner(s.stderr)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			fmt.Fprintf(os.Stderr, "[claude stderr] %s\n", line)
+		}
+	}
 }
