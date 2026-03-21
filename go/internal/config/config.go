@@ -29,8 +29,17 @@ type TrackerConfig struct {
 	Endpoint       string   `yaml:"endpoint"`
 	APIKey         string   `yaml:"api_key"`
 	ProjectSlug    string   `yaml:"project_slug"`
+	TeamKey        string   `yaml:"team_key"`
 	ActiveStates   []string `yaml:"active_states"`
 	TerminalStates []string `yaml:"terminal_states"`
+
+	// OAuth fields for bot/agent identity. When AgentToken is set it takes
+	// priority over APIKey. OAuthClientID + OAuthClientSecret + RefreshToken
+	// enable automatic token refresh when AgentToken expires.
+	AgentToken        string `yaml:"agent_token"`
+	OAuthClientID     string `yaml:"oauth_client_id"`
+	OAuthClientSecret string `yaml:"oauth_client_secret"`
+	RefreshToken      string `yaml:"refresh_token"`
 }
 
 // PollingConfig holds polling settings.
@@ -59,6 +68,9 @@ type AgentConfig struct {
 	MaxRetryBackoffMS          int            `yaml:"max_retry_backoff_ms"`
 	MaxConcurrentAgentsByState map[string]int `yaml:"max_concurrent_agents_by_state"`
 	Default                    string         `yaml:"default"`
+	SkillPath                  string         `yaml:"skill_path"`
+	ProjectPriority            []string       `yaml:"project_priority"`
+	InProgressLabel            string         `yaml:"in_progress_label"`
 }
 
 // CodexConfig holds Codex-specific settings.
@@ -81,6 +93,7 @@ type ServerConfig struct {
 type Workflow struct {
 	Config         Config
 	PromptTemplate string
+	SkillContent   string // Loaded from agent.skill_path if set
 }
 
 // LoadWorkflow loads and parses a WORKFLOW.md file.
@@ -121,6 +134,15 @@ func ParseWorkflow(data []byte) (*Workflow, error) {
 	workflow.Config = applyDefaults(workflow.Config)
 	workflow.Config = resolveEnvVars(workflow.Config)
 
+	// Load skill content if configured
+	if workflow.Config.Agent.SkillPath != "" {
+		content, err := os.ReadFile(workflow.Config.Agent.SkillPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read skill file %q: %w", workflow.Config.Agent.SkillPath, err)
+		}
+		workflow.SkillContent = string(content)
+	}
+
 	return workflow, nil
 }
 
@@ -148,6 +170,7 @@ func DefaultConfig() Config {
 			MaxRetryBackoffMS:          300000,
 			MaxConcurrentAgentsByState: make(map[string]int),
 			Default:                    "codex",
+			InProgressLabel:            "AGENT: In Progress",
 		},
 		Codex: CodexConfig{
 			Command:        "codex app-server",
@@ -194,6 +217,12 @@ func applyDefaults(cfg Config) Config {
 	if cfg.Agent.Default == "" {
 		cfg.Agent.Default = defaults.Agent.Default
 	}
+	if cfg.Agent.InProgressLabel == "" {
+		cfg.Agent.InProgressLabel = defaults.Agent.InProgressLabel
+	}
+	if cfg.Agent.SkillPath != "" {
+		cfg.Agent.SkillPath = expandPath(cfg.Agent.SkillPath)
+	}
 	if cfg.Codex.Command == "" {
 		cfg.Codex.Command = defaults.Codex.Command
 	}
@@ -215,7 +244,29 @@ var envVarRegex = regexp.MustCompile(`\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?`)
 
 func resolveEnvVars(cfg Config) Config {
 	cfg.Tracker.APIKey = resolveEnvVar(cfg.Tracker.APIKey)
+	cfg.Tracker.AgentToken = resolveEnvVar(cfg.Tracker.AgentToken)
+	cfg.Tracker.OAuthClientID = resolveEnvVar(cfg.Tracker.OAuthClientID)
+	cfg.Tracker.OAuthClientSecret = resolveEnvVar(cfg.Tracker.OAuthClientSecret)
+	cfg.Tracker.RefreshToken = resolveEnvVar(cfg.Tracker.RefreshToken)
 	cfg.Workspace.Root = expandPath(cfg.Workspace.Root)
+
+	// Fall back to well-known environment variable names when fields are blank.
+	if cfg.Tracker.AgentToken == "" {
+		cfg.Tracker.AgentToken = os.Getenv("LINEAR_AGENT_TOKEN")
+	}
+	if cfg.Tracker.OAuthClientID == "" {
+		cfg.Tracker.OAuthClientID = os.Getenv("LINEAR_OAUTH_CLIENT_ID")
+	}
+	if cfg.Tracker.OAuthClientSecret == "" {
+		cfg.Tracker.OAuthClientSecret = os.Getenv("LINEAR_OAUTH_CLIENT_SECRET")
+	}
+	if cfg.Tracker.RefreshToken == "" {
+		cfg.Tracker.RefreshToken = os.Getenv("LINEAR_REFRESH_TOKEN")
+	}
+	if cfg.Tracker.APIKey == "" {
+		cfg.Tracker.APIKey = os.Getenv("LINEAR_API_KEY")
+	}
+
 	return cfg
 }
 
@@ -250,11 +301,11 @@ func (c *Config) Validate() error {
 	if c.Tracker.Kind != "linear" {
 		return fmt.Errorf("unsupported tracker kind: %s", c.Tracker.Kind)
 	}
-	if c.Tracker.APIKey == "" {
-		return fmt.Errorf("tracker.api_key is required (set LINEAR_API_KEY)")
+	if c.Tracker.AgentToken == "" && c.Tracker.APIKey == "" {
+		return fmt.Errorf("Linear credentials required: set LINEAR_AGENT_TOKEN (OAuth bot) or LINEAR_API_KEY (personal key)")
 	}
-	if c.Tracker.ProjectSlug == "" {
-		return fmt.Errorf("tracker.project_slug is required")
+	if c.Tracker.ProjectSlug == "" && c.Tracker.TeamKey == "" {
+		return fmt.Errorf("tracker.project_slug or tracker.team_key is required")
 	}
 	if c.Codex.Command == "" {
 		return fmt.Errorf("codex.command is required")

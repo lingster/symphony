@@ -139,29 +139,189 @@ You are working on issue {{issue.identifier}}: {{issue.title}}
 4. Commit your work
 ```
 
-## Usage
-
-```bash
-# Run with default WORKFLOW.md
-symphony
-
-# Run with specific workflow file
-symphony path/to/WORKFLOW.md
-
-# Or use flag
-symphony --workflow path/to/WORKFLOW.md
-```
-
-## Environment Variables
-
-- `LINEAR_API_KEY`: API token for Linear (required)
-
 ## Building
 
 ```bash
 cd go/
 go build -o symphony ./cmd/symphony
+
+# With version info embedded at build time
+go build -ldflags "-X main.version=1.0.0" -o symphony ./cmd/symphony
 ```
+
+## Quick Start
+
+```bash
+# 1. Build
+cd go/
+go build -o symphony ./cmd/symphony
+
+# 2. Configure Linear credentials (see Authentication section below)
+cp .env.example .env
+# Edit .env with your credentials
+
+# 3. Create a WORKFLOW.md (see Configuration section above)
+
+# 4. Start the orchestration service
+./symphony start
+```
+
+## Authentication
+
+Symphony requires Linear credentials. You have two options:
+
+### Option A: Personal API Key (simplest)
+
+1. Go to [Linear Settings > API > Personal API Keys](https://linear.app/settings/api)
+2. Create a new key
+3. Add to your `.env`:
+   ```
+   LINEAR_API_KEY=lin_api_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+
+This is the quickest setup. Actions will appear as your personal user.
+
+### Option B: OAuth Agent Token (bot identity)
+
+This creates a dedicated bot user in your Linear workspace. You need workspace admin permissions.
+
+#### Prerequisites
+
+1. Create an OAuth application at [Linear Settings > API > OAuth Applications](https://linear.app/settings/api/applications)
+2. Set the callback URL to `http://localhost:3456/callback`
+3. Note your **Client ID** and **Client Secret**
+
+#### With browser access
+
+```bash
+LINEAR_OAUTH_CLIENT_ID=xxx LINEAR_OAUTH_CLIENT_SECRET=xxx go run ./cmd/oauth-setup/
+```
+
+This opens your browser to authorize, exchanges the code, and prints the tokens to add to your `.env`.
+
+#### On a remote/headless server (no browser)
+
+1. Run the setup on the remote server:
+   ```bash
+   LINEAR_OAUTH_CLIENT_ID=xxx LINEAR_OAUTH_CLIENT_SECRET=xxx go run ./cmd/oauth-setup/
+   ```
+2. Copy the printed authorization URL and open it in your **local** browser
+3. After authorizing, Linear redirects to `http://localhost:3456/callback?code=SOME_CODE` — this will fail in your browser (that's expected)
+4. Copy the `code` parameter from the browser's address bar and paste it into the stdin prompt on the remote server
+
+Alternatively, use **SSH port forwarding** so the redirect works automatically:
+
+```bash
+ssh -L 3456:localhost:3456 your-remote-server
+# Then run the oauth-setup command as normal
+```
+
+#### Result
+
+After completing the OAuth flow, add the output to your `.env`:
+
+```
+LINEAR_AGENT_TOKEN=<access_token>
+LINEAR_REFRESH_TOKEN=<refresh_token>
+LINEAR_OAUTH_CLIENT_ID=<client_id>
+LINEAR_OAUTH_CLIENT_SECRET=<client_secret>
+```
+
+When all four values are set, Symphony automatically refreshes the token when it expires.
+
+## Usage
+
+Symphony uses subcommands. Run `symphony --help` for a full overview.
+
+### Global Flags
+
+| Flag | Description | Default |
+|---|---|---|
+| `--workflow <path>` | Path to `WORKFLOW.md` | `./WORKFLOW.md` |
+| `-h`, `--help` | Show help for any command | — |
+
+### Commands
+
+#### `symphony start [workflow-path]`
+
+Start the orchestration service. Polls Linear for issues, creates workspaces, and dispatches agents. Runs until interrupted (SIGINT/SIGTERM).
+
+```bash
+# Start with default ./WORKFLOW.md
+symphony start
+
+# Start with a specific workflow file
+symphony start path/to/WORKFLOW.md
+
+# Or use the global --workflow flag
+symphony --workflow path/to/WORKFLOW.md start
+```
+
+#### `symphony linear list`
+
+Fetch and display pending issues from the configured Linear project (issues in active states).
+
+```bash
+symphony linear list
+symphony --workflow path/to/WORKFLOW.md linear list
+```
+
+Output includes identifier, state, priority, assignee, and title in a tabular format. Blocked issues are listed separately.
+
+#### `symphony agent run --agent <name> <prompt>`
+
+Launch a single coding agent with a prompt in the current directory. Useful for testing agent dispatch outside the orchestration loop.
+
+```bash
+symphony agent run --agent claude "Explain the main function"
+symphony agent run --agent codex "Fix the failing tests"
+symphony agent run --agent gemini --verbose "List all TODO comments"
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `--agent <name>` | Agent to use: `codex`, `claude`, `gemini` | `codex` |
+| `--verbose` | Stream all agent events to stderr | `false` |
+
+Without `--verbose`, only errors are shown during execution and a summary is printed when the agent finishes. With `--verbose`, all events (messages, tool calls, results) are streamed to stderr in real-time.
+
+#### `symphony agent list`
+
+List all available agents and their descriptions.
+
+```bash
+symphony agent list
+```
+
+#### `symphony version`
+
+Print the Symphony version.
+
+```bash
+symphony version
+```
+
+#### `symphony completion`
+
+Generate shell autocompletion scripts (provided by Cobra).
+
+```bash
+# Bash
+symphony completion bash > /etc/bash_completion.d/symphony
+
+# Zsh
+symphony completion zsh > "${fpath[1]}/_symphony"
+```
+
+### Environment Variables
+
+| Variable | Description | Required |
+|---|---|---|
+| `LINEAR_API_KEY` | Linear personal API token | Yes (unless using OAuth) |
+| `LINEAR_AGENT_TOKEN` | Linear OAuth agent token (takes priority over `LINEAR_API_KEY`) | No |
+| `LINEAR_OAUTH_CLIENT_ID` | OAuth client ID for automatic token refresh | No |
+| `LINEAR_OAUTH_CLIENT_SECRET` | OAuth client secret for token refresh | No |
+| `LINEAR_REFRESH_TOKEN` | OAuth refresh token | No |
 
 ## Core Concepts
 
@@ -197,13 +357,19 @@ Issues are sorted for dispatch:
 go/
 ├── cmd/
 │   └── symphony/
-│       └── main.go           # CLI entrypoint
+│       ├── main.go           # CLI entrypoint
+│       ├── root.go           # Root Cobra command + global flags
+│       ├── start.go          # start command (orchestration service)
+│       ├── linear.go         # linear list command
+│       ├── agent.go          # agent run/list commands
+│       └── version.go        # version command
 ├── internal/
 │   ├── agent/
 │   │   ├── agent.go          # Interface + Registry
 │   │   ├── codex.go          # Codex implementation
 │   │   ├── claude.go         # Claude Code implementation
-│   │   └── gemini.go         # Gemini CLI implementation
+│   │   ├── gemini.go         # Gemini CLI implementation
+│   │   └── router.go         # Assignee-based agent routing
 │   ├── config/
 │   │   └── config.go         # WORKFLOW.md parsing
 │   ├── linear/

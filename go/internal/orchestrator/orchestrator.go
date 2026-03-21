@@ -23,10 +23,11 @@ type Orchestrator struct {
 	workspace *workspace.Manager
 	agents    *agent.Registry
 
-	mu            sync.RWMutex
-	running       map[string]*RunEntry
-	claimed       map[string]struct{}
-	retryAttempts map[string]*RetryEntry
+	mu                sync.RWMutex
+	running           map[string]*RunEntry
+	claimed           map[string]struct{}
+	retryAttempts     map[string]*RetryEntry
+	inProgressLabelID string // cached "AGENT: In Progress" label ID
 
 	logger *slog.Logger
 	ctx    context.Context
@@ -60,7 +61,18 @@ func New(cfg *config.Workflow, logger *slog.Logger) (*Orchestrator, error) {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 
-	tracker := linear.NewClient(cfg.Config.Tracker.Endpoint, cfg.Config.Tracker.APIKey)
+	var tracker *linear.Client
+	if cfg.Config.Tracker.AgentToken != "" {
+		tracker = linear.NewClientWithToken(
+			cfg.Config.Tracker.Endpoint,
+			cfg.Config.Tracker.AgentToken,
+			cfg.Config.Tracker.OAuthClientID,
+			cfg.Config.Tracker.OAuthClientSecret,
+			cfg.Config.Tracker.RefreshToken,
+		)
+	} else {
+		tracker = linear.NewClient(cfg.Config.Tracker.Endpoint, cfg.Config.Tracker.APIKey)
+	}
 
 	wsMgr := workspace.NewManager(
 		cfg.Config.Workspace.Root,
@@ -81,7 +93,7 @@ func New(cfg *config.Workflow, logger *slog.Logger) (*Orchestrator, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Orchestrator{
+	orch := &Orchestrator{
 		config:        cfg,
 		tracker:       tracker,
 		workspace:     wsMgr,
@@ -92,7 +104,22 @@ func New(cfg *config.Workflow, logger *slog.Logger) (*Orchestrator, error) {
 		logger:        logger,
 		ctx:           ctx,
 		cancel:        cancel,
-	}, nil
+	}
+
+	// Resolve "AGENT: In Progress" label ID
+	teamKey := cfg.Config.Tracker.TeamKey
+	if teamKey != "" {
+		labelName := cfg.Config.Agent.InProgressLabel
+		labelID, err := tracker.FindOrCreateLabel(ctx, teamKey, labelName, "#4EA7FC")
+		if err != nil {
+			logger.Warn("failed to resolve in-progress label, label lifecycle disabled", "error", err)
+		} else {
+			orch.inProgressLabelID = labelID
+			logger.Info("resolved in-progress label", "label", labelName, "id", labelID)
+		}
+	}
+
+	return orch, nil
 }
 
 // Start begins the orchestration loop.
@@ -157,7 +184,7 @@ func (o *Orchestrator) tick() {
 	// Fetch candidate issues
 	issues, err := o.tracker.FetchCandidateIssues(
 		o.ctx,
-		o.config.Config.Tracker.ProjectSlug,
+		o.issueFilter(),
 		o.config.Config.Tracker.ActiveStates,
 	)
 	if err != nil {
@@ -166,7 +193,7 @@ func (o *Orchestrator) tick() {
 	}
 
 	// Sort issues for dispatch priority
-	sortForDispatch(issues)
+	sortForDispatch(issues, o.config.Config.Agent.ProjectPriority)
 
 	// Dispatch eligible issues
 	for _, issue := range issues {
@@ -342,6 +369,14 @@ func (o *Orchestrator) shouldDispatch(issue linear.Issue) bool {
 		return false
 	}
 
+	// Skip issues that already have the "AGENT: In Progress" label
+	inProgressLabel := strings.ToLower(o.config.Config.Agent.InProgressLabel)
+	for _, label := range issue.Labels {
+		if label == inProgressLabel {
+			return false
+		}
+	}
+
 	// Check blocker rule for Todo state
 	stateLower := strings.ToLower(issue.State)
 	if stateLower == "todo" {
@@ -380,10 +415,57 @@ func (o *Orchestrator) dispatch(issue linear.Issue) {
 	o.claimed[issue.ID] = struct{}{}
 	o.mu.Unlock()
 
-	// Select agent based on assignee
+	// Add "AGENT: In Progress" label
+	o.addInProgressLabel(issue)
+
+	// Select agent based on labels, then assignee
 	selectedAgent := o.selectAgent(issue)
 
 	go o.runWorker(issue, selectedAgent)
+}
+
+func (o *Orchestrator) addInProgressLabel(issue linear.Issue) {
+	if o.inProgressLabelID == "" {
+		return
+	}
+
+	// Check if already has the label
+	for _, id := range issue.LabelIDs {
+		if id == o.inProgressLabelID {
+			return
+		}
+	}
+
+	labelIDs := append(issue.LabelIDs, o.inProgressLabelID)
+	if err := o.tracker.UpdateIssueLabels(o.ctx, issue.ID, labelIDs); err != nil {
+		o.logger.Warn("failed to add in-progress label", "issue", issue.Identifier, "error", err)
+	} else {
+		o.logger.Debug("added in-progress label", "issue", issue.Identifier)
+	}
+}
+
+func (o *Orchestrator) removeInProgressLabel(issue linear.Issue) {
+	if o.inProgressLabelID == "" {
+		return
+	}
+
+	var labelIDs []string
+	for _, id := range issue.LabelIDs {
+		if id != o.inProgressLabelID {
+			labelIDs = append(labelIDs, id)
+		}
+	}
+
+	// Only update if we actually removed something
+	if len(labelIDs) == len(issue.LabelIDs) {
+		return
+	}
+
+	if err := o.tracker.UpdateIssueLabels(o.ctx, issue.ID, labelIDs); err != nil {
+		o.logger.Warn("failed to remove in-progress label", "issue", issue.Identifier, "error", err)
+	} else {
+		o.logger.Debug("removed in-progress label", "issue", issue.Identifier)
+	}
 }
 
 func (o *Orchestrator) selectAgent(issue linear.Issue) agent.Agent {
@@ -392,24 +474,28 @@ func (o *Orchestrator) selectAgent(issue linear.Issue) agent.Agent {
 		defaultAgent = "codex"
 	}
 
-	// Route based on assignee name
+	// Check labels first (exact or prefixed: "claude", "agent:claude", "agent: claude")
+	agentNames := []string{"codex", "claude", "gemini"}
+	for _, label := range issue.Labels {
+		for _, agentName := range agentNames {
+			if matchesAgentLabel(label, agentName) {
+				if a, ok := o.agents.Get(agentName); ok {
+					return a
+				}
+			}
+		}
+	}
+
+	// Fall back to assignee-based routing
 	if issue.Assignee != nil {
 		name := strings.ToLower(issue.Assignee.Name)
 		username := strings.ToLower(issue.Assignee.Username)
 
-		if strings.Contains(name, "gemini") || strings.Contains(username, "gemini") {
-			if a, ok := o.agents.Get("gemini"); ok {
-				return a
-			}
-		}
-		if strings.Contains(name, "claude") || strings.Contains(username, "claude") {
-			if a, ok := o.agents.Get("claude"); ok {
-				return a
-			}
-		}
-		if strings.Contains(name, "codex") || strings.Contains(username, "codex") {
-			if a, ok := o.agents.Get("codex"); ok {
-				return a
+		for _, agentName := range agentNames {
+			if strings.Contains(name, agentName) || strings.Contains(username, agentName) {
+				if a, ok := o.agents.Get(agentName); ok {
+					return a
+				}
 			}
 		}
 	}
@@ -422,6 +508,24 @@ func (o *Orchestrator) selectAgent(issue linear.Issue) agent.Agent {
 	// Fallback to codex
 	a, _ := o.agents.Get("codex")
 	return a
+}
+
+// matchesAgentLabel checks if a label matches an agent name.
+// Supports: "claude", "agent:claude", "agent: claude" (case-insensitive, labels already lowered).
+func matchesAgentLabel(label, agentName string) bool {
+	if label == agentName {
+		return true
+	}
+	// Check prefix patterns: "agent:X", "agent: X"
+	prefixes := []string{"agent:", "agent: "}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(label, prefix) {
+			if strings.TrimSpace(label[len(prefix):]) == agentName {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) {
@@ -509,6 +613,9 @@ func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) 
 	delete(o.running, issue.ID)
 	o.mu.Unlock()
 
+	// Remove "AGENT: In Progress" label
+	o.removeInProgressLabel(issue)
+
 	// Schedule continuation retry
 	o.scheduleRetry(issue.ID, issue.Identifier, 1, "")
 
@@ -519,6 +626,9 @@ func (o *Orchestrator) handleWorkerFailure(issue linear.Issue, attempt int, errM
 	o.mu.Lock()
 	delete(o.running, issue.ID)
 	o.mu.Unlock()
+
+	// Remove "AGENT: In Progress" label on failure
+	o.removeInProgressLabel(issue)
 
 	o.scheduleRetry(issue.ID, issue.Identifier, attempt, errMsg)
 }
@@ -572,11 +682,19 @@ func (o *Orchestrator) buildPrompt(issue linear.Issue, attempt *int) (string, er
 	prompt = strings.ReplaceAll(prompt, "{{issue.description}}", issue.Description)
 	prompt = strings.ReplaceAll(prompt, "{{issue.state}}", issue.State)
 	prompt = strings.ReplaceAll(prompt, "{{issue.url}}", issue.URL)
+	prompt = strings.ReplaceAll(prompt, "{{issue.branch_name}}", issue.BranchName)
+	prompt = strings.ReplaceAll(prompt, "{{issue.project}}", issue.Project)
+	prompt = strings.ReplaceAll(prompt, "{{issue.labels}}", strings.Join(issue.Labels, ", "))
 
 	if attempt != nil {
 		prompt = strings.ReplaceAll(prompt, "{{attempt}}", fmt.Sprintf("%d", *attempt))
 	} else {
 		prompt = strings.ReplaceAll(prompt, "{{attempt}}", "")
+	}
+
+	// Prepend skill content if available
+	if o.config.SkillContent != "" {
+		prompt = o.config.SkillContent + "\n\n---\n\n" + prompt
 	}
 
 	return prompt, nil
@@ -586,7 +704,7 @@ func (o *Orchestrator) startupCleanup() error {
 	// Fetch terminal issues
 	issues, err := o.tracker.FetchIssuesByStates(
 		o.ctx,
-		o.config.Config.Tracker.ProjectSlug,
+		o.issueFilter(),
 		o.config.Config.Tracker.TerminalStates,
 	)
 	if err != nil {
@@ -671,28 +789,98 @@ type RetryInfo struct {
 	Error      string    `json:"error,omitempty"`
 }
 
-func sortForDispatch(issues []linear.Issue) {
+// sortForDispatch sorts issues for dispatch priority using project ranking,
+// state preference, Linear priority, and staleness.
+func sortForDispatch(issues []linear.Issue, projectPriority []string) {
+	// Build project rank lookup (lower rank = higher priority)
+	projectRank := make(map[string]int)
+	for i, name := range projectPriority {
+		projectRank[strings.ToLower(name)] = i
+	}
+
+	// State rank: "In Progress" first (resume), then "Todo", then everything else
+	stateRank := func(state string) int {
+		switch strings.ToLower(state) {
+		case "in progress":
+			return 0
+		case "todo":
+			return 1
+		case "backlog":
+			return 2
+		default:
+			return 3
+		}
+	}
+
 	sort.SliceStable(issues, func(i, j int) bool {
-		// Priority ascending (lower is higher priority)
+		// 1. Project priority (if configured)
+		if len(projectPriority) > 0 {
+			pi := len(projectPriority) // unlisted projects sort last
+			pj := len(projectPriority)
+			if rank, ok := projectRank[strings.ToLower(issues[i].Project)]; ok {
+				pi = rank
+			}
+			if rank, ok := projectRank[strings.ToLower(issues[j].Project)]; ok {
+				pj = rank
+			}
+			if pi != pj {
+				return pi < pj
+			}
+		}
+
+		// 2. State: In Progress > Todo > Backlog > other
+		si, sj := stateRank(issues[i].State), stateRank(issues[j].State)
+		if si != sj {
+			return si < sj
+		}
+
+		// 3. Linear priority ascending (1=Urgent, 2=High, etc.; 0/nil = no priority = lowest)
 		pi, pj := 999, 999
-		if issues[i].Priority != nil {
+		if issues[i].Priority != nil && *issues[i].Priority > 0 {
 			pi = *issues[i].Priority
 		}
-		if issues[j].Priority != nil {
+		if issues[j].Priority != nil && *issues[j].Priority > 0 {
 			pj = *issues[j].Priority
 		}
 		if pi != pj {
 			return pi < pj
 		}
 
-		// Created at oldest first
-		if !issues[i].CreatedAt.Equal(issues[j].CreatedAt) {
-			return issues[i].CreatedAt.Before(issues[j].CreatedAt)
+		// 4. Staleness: least recently updated first (waiting longest)
+		if !issues[i].UpdatedAt.Equal(issues[j].UpdatedAt) {
+			return issues[i].UpdatedAt.Before(issues[j].UpdatedAt)
 		}
 
-		// Identifier lexicographic
+		// 5. Identifier (stable tiebreaker)
 		return issues[i].Identifier < issues[j].Identifier
 	})
+}
+
+// Tracker returns the underlying Linear client.
+func (o *Orchestrator) Tracker() *linear.Client {
+	return o.tracker
+}
+
+// Agents returns the agent registry.
+func (o *Orchestrator) Agents() *agent.Registry {
+	return o.agents
+}
+
+// BuildPromptForIssue builds a prompt for a given issue (public wrapper).
+func (o *Orchestrator) BuildPromptForIssue(issue linear.Issue) (string, error) {
+	return o.buildPrompt(issue, nil)
+}
+
+// IssueFilter returns the configured issue filter.
+func (o *Orchestrator) IssueFilter() linear.IssueFilter {
+	return o.issueFilter()
+}
+
+func (o *Orchestrator) issueFilter() linear.IssueFilter {
+	return linear.IssueFilter{
+		ProjectSlug: o.config.Config.Tracker.ProjectSlug,
+		TeamKey:     o.config.Config.Tracker.TeamKey,
+	}
 }
 
 func truncate(s string, maxLen int) string {
