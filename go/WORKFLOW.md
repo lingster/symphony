@@ -14,7 +14,7 @@ polling:
   interval_ms: 30000
 
 workspace:
-  root: ~/workspaces/symphony
+  root: ./workarea 
 
 hooks:
   # after_create: |
@@ -86,17 +86,19 @@ bash /home/ling/workarea/lingster/symphony/linear-claude-skill/scripts/query.sh 
    bash /home/ling/workarea/lingster/symphony/linear-claude-skill/scripts/query.sh 'mutation { issueUpdate(id: "{{issue.id}}", input: { stateId: "a66a7ef9-31fd-4aab-9b5b-a96fb383566a" }) { success } }'
    ```
 
-2. **Create a feature branch** named `feature/{{issue.identifier}}`
+1a. Your workarea will be a folder called workarea/{reponame} eg workarea/crowdcent-lstm. There are 2 folders: main and develop. The main contains check out of the main branch and develop current contains feature/frontend, which we consider as the develop branch and is the branch used to deploy to the develop environment. Before starting any task also update the feature/frontend to the latest version of code. 
+
+2. **Create a feature branch** named `feature/{{issue.identifier}}` this should be in location workarea/crowdcent-lstm/{{issue.identifier}}
 
 3. **Read the codebase** and understand the existing code structure
 
-4. **Implement the required changes** described in the issue description above
+4. **Implement the required changes** described in the issue description above, however if anything is unclear please respond and add a label "Human Required" and consider this task complete. When addressing the task, if you encounter any unleated issues feel free to create a linear sub-task and label this "Human Required" and continue solving the original issue. Always use red/green TDD, SOLID, DRY coding principals. 
 
 5. **Run any existing tests** to verify your changes
 
-6. **Commit your work** with a clear, descriptive commit message referencing {{issue.identifier}}
+6. **Commit your work** with a clear, descriptive commit message referencing {{issue.identifier}}, after committing and pushing code, wait 20 mins and check github actions for any code review commits and ensure that you resolve each one, but addressing it and adding summary of what you did to resolve it. Repeat until all code review comments have been resolved. 
 
-7. **Update Linear to "Done"** and add a summary comment:
+7. **Update Linear to "Review"** and add a summary comment and add label Human Required:
    ```bash
    bash /home/ling/workarea/lingster/symphony/linear-claude-skill/scripts/query.sh 'mutation { commentCreate(input: { issueId: "{{issue.id}}", body: "Completed: brief summary of changes made" }) { success } }'
    bash /home/ling/workarea/lingster/symphony/linear-claude-skill/scripts/query.sh 'mutation { issueUpdate(id: "{{issue.id}}", input: { stateId: "e19a65e1-753e-462d-8bc1-6fecea27dc7b" }) { success } }'
