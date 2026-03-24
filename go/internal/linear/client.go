@@ -127,10 +127,12 @@ type graphqlResponse struct {
 }
 
 // IssueFilter specifies how to scope issue queries. Set either ProjectSlug
-// or TeamKey (TeamKey takes precedence if both are set).
+// or TeamKey (TeamKey takes precedence if both are set). When AssigneeID is
+// set, only issues assigned to that user are returned.
 type IssueFilter struct {
 	ProjectSlug string
 	TeamKey     string
+	AssigneeID  string
 }
 
 // FetchCandidateIssues fetches issues in active states scoped by the filter.
@@ -240,12 +242,24 @@ const issueNodeFragment = `
 `
 
 func (c *Client) buildIssueQuery(filter IssueFilter) (string, map[string]interface{}) {
+	// Build the assignee filter clause if an AssigneeID is specified.
+	assigneeFilter := ""
+	assigneeVar := ""
+	vars := make(map[string]interface{})
+
+	if filter.AssigneeID != "" {
+		assigneeVar = ", $assigneeId: ID!"
+		assigneeFilter = "\n\t\t\t\t\t\tassignee: { id: { eq: $assigneeId } }"
+		vars["assigneeId"] = filter.AssigneeID
+	}
+
 	if filter.TeamKey != "" {
+		vars["teamKey"] = filter.TeamKey
 		query := `
-			query($teamKey: String!, $first: Int!, $after: String) {
+			query($teamKey: String!, $first: Int!, $after: String` + assigneeVar + `) {
 				issues(
 					filter: {
-						team: { key: { eq: $teamKey } }
+						team: { key: { eq: $teamKey } }` + assigneeFilter + `
 					}
 					first: $first
 					after: $after
@@ -260,14 +274,15 @@ func (c *Client) buildIssueQuery(filter IssueFilter) (string, map[string]interfa
 				}
 			}
 		`
-		return query, map[string]interface{}{"teamKey": filter.TeamKey}
+		return query, vars
 	}
 
+	vars["projectSlug"] = filter.ProjectSlug
 	query := `
-		query($projectSlug: String!, $first: Int!, $after: String) {
+		query($projectSlug: String!, $first: Int!, $after: String` + assigneeVar + `) {
 			issues(
 				filter: {
-					project: { slugId: { eq: $projectSlug } }
+					project: { slugId: { eq: $projectSlug } }` + assigneeFilter + `
 				}
 				first: $first
 				after: $after
@@ -282,7 +297,7 @@ func (c *Client) buildIssueQuery(filter IssueFilter) (string, map[string]interfa
 			}
 		}
 	`
-	return query, map[string]interface{}{"projectSlug": filter.ProjectSlug}
+	return query, vars
 }
 
 // FetchIssuesByIDs fetches issues by their IDs for reconciliation.
@@ -882,6 +897,45 @@ func (c *Client) UpdateIssueLabels(ctx context.Context, issueID string, labelIDs
 	}
 
 	return nil
+}
+
+// FetchViewer returns the authenticated user's ID and display name using the
+// Linear viewer query. This is used to identify the bot user for assignee filtering.
+func (c *Client) FetchViewer(ctx context.Context) (*Assignee, error) {
+	query := `
+		query {
+			viewer {
+				id
+				name
+				displayName
+				email
+			}
+		}
+	`
+
+	resp, err := c.execute(ctx, query, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch viewer: %w", err)
+	}
+
+	var data struct {
+		Viewer struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+			Email       string `json:"email"`
+		} `json:"viewer"`
+	}
+	if err := json.Unmarshal(resp, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse viewer response: %w", err)
+	}
+
+	return &Assignee{
+		ID:       data.Viewer.ID,
+		Name:     data.Viewer.Name,
+		Username: data.Viewer.DisplayName,
+		Email:    data.Viewer.Email,
+	}, nil
 }
 
 // FetchIssueByIdentifier fetches a single issue by its human-readable identifier (e.g. NUM-1).

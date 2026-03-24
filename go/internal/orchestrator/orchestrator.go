@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -30,6 +31,10 @@ type Orchestrator struct {
 	retryAttempts     map[string]*RetryEntry
 	inProgressLabelID string // cached "AGENT: In Progress" label ID
 
+	showPrompt bool   // when true, print prompts before sending to agents
+	botUserID  string // resolved bot user ID for assignee filtering
+
+	wg     sync.WaitGroup // tracks running worker goroutines
 	logger *slog.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -137,6 +142,17 @@ func New(cfg *config.Workflow, logger *slog.Logger) (*Orchestrator, error) {
 		}
 	}
 
+	// Resolve bot user ID for assignee filtering
+	if cfg.Config.Tracker.FilterByAssignee {
+		viewer, err := tracker.FetchViewer(ctx)
+		if err != nil {
+			logger.Warn("failed to resolve bot user for assignee filtering, filter disabled", "error", err)
+		} else {
+			orch.botUserID = viewer.ID
+			logger.Info("assignee filtering enabled", "bot_user", viewer.Name, "bot_user_id", viewer.ID)
+		}
+	}
+
 	return orch, nil
 }
 
@@ -163,16 +179,49 @@ func (o *Orchestrator) Start() error {
 	return nil
 }
 
-// Stop stops the orchestration loop.
-func (o *Orchestrator) Stop() {
+// GracefulStop stops accepting new work and waits for running agents to
+// complete their current tasks. Returns true if all agents finished, false
+// if the context was cancelled (e.g. a second signal arrived) before they
+// completed.
+func (o *Orchestrator) GracefulStop() bool {
+	o.cancel() // stop polling loop and prevent new dispatches
+
+	o.logger.Info("waiting for running agents to complete...")
+
+	done := make(chan struct{})
+	go func() {
+		o.wg.Wait()
+		close(done)
+	}()
+
+	o.mu.RLock()
+	count := len(o.running)
+	o.mu.RUnlock()
+
+	if count > 0 {
+		o.logger.Info("agents still running, waiting for completion", "count", count)
+	}
+
+	<-done
+	return true
+}
+
+// ForceStop immediately kills all running agent sessions.
+func (o *Orchestrator) ForceStop() {
 	o.cancel()
 
-	// Stop all running sessions
 	o.mu.Lock()
 	for _, entry := range o.running {
 		entry.Session.Stop()
 	}
 	o.mu.Unlock()
+}
+
+// RunningCount returns the number of currently running agents.
+func (o *Orchestrator) RunningCount() int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return len(o.running)
 }
 
 func (o *Orchestrator) pollLoop() {
@@ -439,6 +488,7 @@ func (o *Orchestrator) dispatch(issue linear.Issue) {
 	// Select agent based on labels, then assignee
 	selectedAgent := o.selectAgent(issue)
 
+	o.wg.Add(1)
 	go o.runWorker(issue, selectedAgent)
 }
 
@@ -547,6 +597,7 @@ func matchesAgentLabel(label, agentName string) bool {
 }
 
 func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) {
+	defer o.wg.Done()
 	ctx := o.ctx
 	logger := o.logger.With(
 		"issue_id", issue.ID,
@@ -581,6 +632,10 @@ func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) 
 		return
 	}
 
+	if o.showPrompt {
+		fmt.Fprintf(os.Stdout, "\n--- Prompt for %s ---\n\n%s\n\n--- End Prompt ---\n\n", issue.Identifier, prompt)
+	}
+
 	// Start agent session
 	session, err := selectedAgent.Start(ctx, ws.Path, prompt, o.config.SkillContent)
 	if err != nil {
@@ -604,20 +659,37 @@ func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) 
 	o.mu.Unlock()
 
 	// Process events
+	completedSuccessfully := false
 	for event := range session.Events() {
 		entry.LastEventAt = time.Now()
 
 		switch event.Type {
 		case agent.EventTypeMessage:
 			logger.Debug("agent message", "content", truncate(event.Content, 100))
+			if event.Content != "" {
+				fmt.Fprintf(os.Stdout, "[%s] %s\n", issue.Identifier, event.Content)
+			}
 		case agent.EventTypeToolUse:
 			logger.Debug("agent tool use", "tool", event.Content)
+			fmt.Fprintf(os.Stdout, "[%s] > %s\n", issue.Identifier, event.Content)
 		case agent.EventTypeToolResult:
-			logger.Debug("agent tool result")
+			logger.Debug("agent tool result", "content", truncate(event.Content, 200))
+			if event.Content != "" {
+				fmt.Fprintf(os.Stdout, "[%s]   %s\n", issue.Identifier, truncate(event.Content, 300))
+			}
 		case agent.EventTypeError:
 			logger.Warn("agent error", "error", event.Content)
+			fmt.Fprintf(os.Stdout, "[%s] ERROR: %s\n", issue.Identifier, event.Content)
 		case agent.EventTypeComplete:
-			logger.Info("agent completed", "reason", event.Content)
+			logger.Info("agent completed", "details", event.Content)
+			fmt.Fprintf(os.Stdout, "[%s] Completed: %s\n", issue.Identifier, event.Content)
+			if event.ResultText != "" {
+				fmt.Fprintf(os.Stdout, "\n=== Agent Result [%s] ===\n%s\n=== End Result ===\n\n",
+					issue.Identifier, event.ResultText)
+			}
+			if strings.Contains(event.Content, "status=success") {
+				completedSuccessfully = true
+			}
 		}
 	}
 
@@ -634,8 +706,14 @@ func (o *Orchestrator) runWorker(issue linear.Issue, selectedAgent agent.Agent) 
 	// Remove "AGENT: In Progress" label
 	o.removeInProgressLabel(issue)
 
-	// Schedule continuation retry
-	o.scheduleRetry(issue.ID, issue.Identifier, 1, "")
+	if completedSuccessfully {
+		logger.Info("task completed successfully, no retry needed",
+			"issue_identifier", issue.Identifier,
+		)
+	} else {
+		// Schedule continuation retry only if the agent did not complete successfully
+		o.scheduleRetry(issue.ID, issue.Identifier, 1, "")
+	}
 
 	logger.Info("worker completed")
 }
@@ -890,6 +968,40 @@ func (o *Orchestrator) SkillContent() string {
 	return o.config.SkillContent
 }
 
+// SetShowPrompt enables printing prompts before sending to agents.
+func (o *Orchestrator) SetShowPrompt(show bool) {
+	o.showPrompt = show
+}
+
+// SelectAgentForIssue selects an agent for a given issue (public wrapper).
+func (o *Orchestrator) SelectAgentForIssue(issue linear.Issue) agent.Agent {
+	return o.selectAgent(issue)
+}
+
+// FetchDispatchQueue fetches candidate issues, sorts them by dispatch priority,
+// and filters to only those that would be dispatched. Used by --dry-run.
+func (o *Orchestrator) FetchDispatchQueue(ctx context.Context) ([]linear.Issue, error) {
+	issues, err := o.tracker.FetchCandidateIssues(
+		ctx,
+		o.issueFilter(),
+		o.config.Config.Tracker.ActiveStates,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch candidates: %w", err)
+	}
+
+	sortForDispatch(issues, o.config.Config.Agent.ProjectPriority)
+
+	var queue []linear.Issue
+	for _, issue := range issues {
+		if o.shouldDispatch(issue) {
+			queue = append(queue, issue)
+		}
+	}
+
+	return queue, nil
+}
+
 // IssueFilter returns the configured issue filter.
 func (o *Orchestrator) IssueFilter() linear.IssueFilter {
 	return o.issueFilter()
@@ -899,6 +1011,7 @@ func (o *Orchestrator) issueFilter() linear.IssueFilter {
 	return linear.IssueFilter{
 		ProjectSlug: o.config.Config.Tracker.ProjectSlug,
 		TeamKey:     o.config.Config.Tracker.TeamKey,
+		AssigneeID:  o.botUserID,
 	}
 }
 

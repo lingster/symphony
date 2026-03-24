@@ -160,7 +160,7 @@ func (s *claudeSession) parseMessage(msg map[string]interface{}, raw []byte) Eve
 		return Event{Type: EventTypeError, Content: errMsg, Raw: raw}
 
 	case "result":
-		return Event{Type: EventTypeComplete, Content: "completed", Raw: raw}
+		return s.parseResultMessage(msg, raw)
 
 	default:
 		// system, rate_limit_event, etc. — pass through as messages
@@ -182,7 +182,7 @@ func (s *claudeSession) parseAssistantMessage(msg map[string]interface{}, raw []
 
 	// Check what types of content blocks are present
 	var textParts []string
-	var toolNames []string
+	var toolDescriptions []string
 
 	for _, block := range contentBlocks {
 		b, ok := block.(map[string]interface{})
@@ -196,7 +196,8 @@ func (s *claudeSession) parseAssistantMessage(msg map[string]interface{}, raw []
 			if name == "" {
 				name = "tool_call"
 			}
-			toolNames = append(toolNames, name)
+			desc := formatToolUse(name, b["input"])
+			toolDescriptions = append(toolDescriptions, desc)
 		case "text":
 			if text, ok := b["text"].(string); ok && text != "" {
 				textParts = append(textParts, text)
@@ -205,8 +206,8 @@ func (s *claudeSession) parseAssistantMessage(msg map[string]interface{}, raw []
 	}
 
 	// Emit tool_use events if present (they take priority)
-	if len(toolNames) > 0 {
-		return Event{Type: EventTypeToolUse, Content: strings.Join(toolNames, ", "), Raw: raw}
+	if len(toolDescriptions) > 0 {
+		return Event{Type: EventTypeToolUse, Content: strings.Join(toolDescriptions, "\n"), Raw: raw}
 	}
 
 	return Event{Type: EventTypeMessage, Content: strings.Join(textParts, ""), Raw: raw}
@@ -224,17 +225,123 @@ func (s *claudeSession) parseUserMessage(msg map[string]interface{}, raw []byte)
 		return Event{Type: EventTypeMessage, Raw: raw}
 	}
 
+	// Also check top-level tool_use_result for richer output
+	toolResult, _ := msg["tool_use_result"].(map[string]interface{})
+
 	for _, block := range contentBlocks {
 		b, ok := block.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		if blockType, _ := b["type"].(string); blockType == "tool_result" {
-			return Event{Type: EventTypeToolResult, Content: "tool_result", Raw: raw}
+			// Prefer stdout from top-level tool_use_result if available
+			var output string
+			if toolResult != nil {
+				if stdout, ok := toolResult["stdout"].(string); ok && stdout != "" {
+					output = stdout
+				}
+				if stderr, ok := toolResult["stderr"].(string); ok && stderr != "" {
+					if output != "" {
+						output += "\n" + stderr
+					} else {
+						output = stderr
+					}
+				}
+			}
+			if output == "" {
+				if content, ok := b["content"].(string); ok {
+					output = content
+				}
+			}
+
+			summary := truncateStr(output, 500)
+			return Event{Type: EventTypeToolResult, Content: summary, Raw: raw}
 		}
 	}
 
 	return Event{Type: EventTypeMessage, Raw: raw}
+}
+
+// parseResultMessage extracts completion details from a Claude CLI result message.
+func (s *claudeSession) parseResultMessage(msg map[string]interface{}, raw []byte) Event {
+	subtype, _ := msg["subtype"].(string)
+	isError, _ := msg["is_error"].(bool)
+	resultText, _ := msg["result"].(string)
+	durationMS, _ := msg["duration_ms"].(float64)
+	costUSD, _ := msg["total_cost_usd"].(float64)
+	numTurns, _ := msg["num_turns"].(float64)
+
+	status := "success"
+	if isError || subtype == "error" {
+		status = "error"
+	}
+
+	summary := fmt.Sprintf("status=%s duration=%.0fs cost=$%.4f turns=%.0f",
+		status, durationMS/1000, costUSD, numTurns)
+	if resultText != "" {
+		truncated := resultText
+		if len(truncated) > 200 {
+			truncated = truncated[:200] + "..."
+		}
+		summary += " result=" + truncated
+	}
+
+	return Event{Type: EventTypeComplete, Content: summary, ResultText: resultText, Raw: raw}
+}
+
+// formatToolUse returns a human-readable summary of a tool invocation.
+func formatToolUse(name string, input interface{}) string {
+	inputMap, ok := input.(map[string]interface{})
+	if !ok {
+		return name
+	}
+
+	switch name {
+	case "Bash":
+		if cmd, ok := inputMap["command"].(string); ok {
+			desc, _ := inputMap["description"].(string)
+			if desc != "" {
+				return fmt.Sprintf("Bash: %s  (%s)", desc, truncateStr(cmd, 120))
+			}
+			return fmt.Sprintf("Bash: %s", truncateStr(cmd, 150))
+		}
+	case "Read":
+		if fp, ok := inputMap["file_path"].(string); ok {
+			return fmt.Sprintf("Read: %s", fp)
+		}
+	case "Write":
+		if fp, ok := inputMap["file_path"].(string); ok {
+			return fmt.Sprintf("Write: %s", fp)
+		}
+	case "Edit":
+		if fp, ok := inputMap["file_path"].(string); ok {
+			return fmt.Sprintf("Edit: %s", fp)
+		}
+	case "Glob":
+		if pattern, ok := inputMap["pattern"].(string); ok {
+			return fmt.Sprintf("Glob: %s", pattern)
+		}
+	case "Grep":
+		if pattern, ok := inputMap["pattern"].(string); ok {
+			return fmt.Sprintf("Grep: %s", pattern)
+		}
+	case "Agent", "Task":
+		if desc, ok := inputMap["description"].(string); ok {
+			return fmt.Sprintf("%s: %s", name, desc)
+		}
+		if prompt, ok := inputMap["prompt"].(string); ok {
+			return fmt.Sprintf("%s: %s", name, truncateStr(prompt, 100))
+		}
+	}
+
+	return name
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
 
 func (s *claudeSession) drainStderr() {

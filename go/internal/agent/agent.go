@@ -44,9 +44,10 @@ const (
 
 // Event represents an event emitted by the agent.
 type Event struct {
-	Type    EventType       `json:"type"`
-	Content string          `json:"content"`
-	Raw     json.RawMessage `json:"raw,omitempty"`
+	Type       EventType       `json:"type"`
+	Content    string          `json:"content"`
+	ResultText string          `json:"result_text,omitempty"` // full result text from agent completion
+	Raw        json.RawMessage `json:"raw,omitempty"`
 }
 
 // Registry holds available agent implementations.

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/ling/symphony/internal/envfile"
 	"gopkg.in/yaml.v3"
@@ -16,12 +17,19 @@ import (
 // Config represents the parsed WORKFLOW.md configuration.
 type Config struct {
 	Tracker   TrackerConfig   `yaml:"tracker"`
+	Tmux      TmuxConfig      `yaml:"tmux"`
 	Polling   PollingConfig   `yaml:"polling"`
 	Workspace WorkspaceConfig `yaml:"workspace"`
 	Hooks     HooksConfig     `yaml:"hooks"`
 	Agent     AgentConfig     `yaml:"agent"`
 	Codex     CodexConfig     `yaml:"codex"`
 	Server    ServerConfig    `yaml:"server"`
+}
+
+// TmuxConfig holds tmux session settings for dispatching agents in tmux panes.
+type TmuxConfig struct {
+	InjectDelayMS int                `yaml:"inject_delay_ms"`
+	Agents        map[string][]string `yaml:"agents"`
 }
 
 // TrackerConfig holds issue tracker settings.
@@ -42,6 +50,10 @@ type TrackerConfig struct {
 	OAuthClientSecret string `yaml:"oauth_client_secret"`
 	RefreshToken      string `yaml:"refresh_token"`
 
+	// FilterByAssignee when true restricts issue fetching to only issues
+	// assigned to the authenticated bot user (resolved via the Linear viewer query).
+	FilterByAssignee bool `yaml:"filter_by_assignee"`
+
 	// Fallback tokens from shell environment, used when .env tokens fail auth.
 	FallbackAgentToken string `yaml:"-"`
 	FallbackAPIKey     string `yaml:"-"`
@@ -49,7 +61,8 @@ type TrackerConfig struct {
 
 // PollingConfig holds polling settings.
 type PollingConfig struct {
-	IntervalMS int `yaml:"interval_ms"`
+	Interval   string `yaml:"interval"`    // Human-friendly duration, e.g. "30s", "5m", "1h"
+	IntervalMS int    `yaml:"interval_ms"` // Milliseconds (legacy, used as fallback)
 }
 
 // WorkspaceConfig holds workspace settings.
@@ -200,6 +213,9 @@ func DefaultConfig() Config {
 			Default:                    "codex",
 			InProgressLabel:            "AGENT: In Progress",
 		},
+		Tmux: TmuxConfig{
+			InjectDelayMS: 5000,
+		},
 		Codex: CodexConfig{
 			Command:        "codex app-server",
 			TurnTimeoutMS:  3600000,
@@ -223,6 +239,12 @@ func applyDefaults(cfg Config) Config {
 	}
 	if len(cfg.Tracker.TerminalStates) == 0 {
 		cfg.Tracker.TerminalStates = defaults.Tracker.TerminalStates
+	}
+	// Resolve human-friendly polling interval into IntervalMS.
+	if cfg.Polling.Interval != "" {
+		if ms, err := parseDuration(cfg.Polling.Interval); err == nil {
+			cfg.Polling.IntervalMS = ms
+		}
 	}
 	if cfg.Polling.IntervalMS == 0 {
 		cfg.Polling.IntervalMS = defaults.Polling.IntervalMS
@@ -250,6 +272,9 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.Agent.SkillPath != "" {
 		cfg.Agent.SkillPath = expandPath(cfg.Agent.SkillPath)
+	}
+	if cfg.Tmux.InjectDelayMS == 0 {
+		cfg.Tmux.InjectDelayMS = defaults.Tmux.InjectDelayMS
 	}
 	if cfg.Codex.Command == "" {
 		cfg.Codex.Command = defaults.Codex.Command
@@ -306,6 +331,29 @@ func resolveEnvVar(s string) string {
 		}
 	}
 	return s
+}
+
+// parseDuration parses a human-friendly duration string into milliseconds.
+// Supported formats: "30s", "5m", "1h", "1h30m", or plain milliseconds "5000".
+// Also supports Go-style durations like "1m30s".
+func parseDuration(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration string")
+	}
+
+	// Try Go's time.ParseDuration first (handles "1h30m", "5m", "30s", etc.)
+	if d, err := time.ParseDuration(s); err == nil {
+		return int(d.Milliseconds()), nil
+	}
+
+	// Try plain integer (treat as milliseconds for backward compat)
+	var ms int
+	if _, err := fmt.Sscanf(s, "%d", &ms); err == nil {
+		return ms, nil
+	}
+
+	return 0, fmt.Errorf("invalid duration format %q: use e.g. 30s, 5m, 1h, or milliseconds", s)
 }
 
 func expandPath(path string) string {
